@@ -1,27 +1,6 @@
-## 任务
+## 学习方法
 
-1. 这几天要把vLLM的 KVCache 在多节点场景下的传输进行评估， @李博(李博) 你就负责LMCache的分析和实验， @杨树宇(杨树宇) 负责mooncacke。 分析一下这里面vLLM有哪些可以优化的地方
-
-   ![img](llm serving.assets/lQLPJxgIlGLklmvNAcfNA6mwAyaRFyIRpocHsR5nBzFnAA_937_455.png)
-
-   ![image-20250313201321275](llm serving.assets/image-20250313201321275.png)
-
-   https://mp.weixin.qq.com/s/Zs61CDerMwI7JKbFyD001Q
-
-2. 暂时先不分析优化点了，先关注长序列场景下，什么时候发生swap或者 cache offload，以及swap的数据量，swap场景构建
-
-3. vllm v1版本的scheduler.py调度没有了swap 这个queue，你们看看你们对应的connector 是否有对应的swapping机制，就是在GPU memory不足的情况下，会发生什么
-
-4. 如何从physical block 对应到cached block
-
-   - 如何从KVCacheBlock到kv cache实际的tensor？
-   - 如何从逻辑块hash到对应的KVCacheBlock？
-
-   
-
-5. nanoflow-sglang论文 计算和通信overlap
-
-
+抓大放小：大的地方要抓住架构和原理，小的地方不要锱铢必较，甚至可以不求甚解，等你需要有针对它的任务时，比如需要对它进行修改，此时才需要对其进行了解。**本质上就是做事情需要有结果和产出，大的地方的产出就是了解架构和思想，小的地方的产出是对其进行修改或者增加feature**
 
 ## p99延迟
 
@@ -171,6 +150,52 @@ Ring AllReduce将每个GPU上的数据切分成多份，GPU只和其相邻的GPU
 
 ![img](llm serving.assets/v2-2444902f73d6be616d72067826beb3b9_r.jpg)
 
+## 张量模型并行TP
+
+模型并行顾名思义就是对模型的权重进行切分
+
+下面是基本的分布式矩阵乘法，如果对输入不切分，那么就要对权重按列切分，计算得到的结果需要进行一次AllGather
+
+![img](llm serving.assets/v2-81594d45e6af07bdbbb0e6020466d668_r.jpg)
+
+如果对输入切分，那么只能按列切分，权重则需要按行切分，计算得到的结果需要进行一次AllReduce
+
+![img](llm serving.assets/v2-318f148eba29aae088699822d66e9733_r.jpg)
+
+对于Transformer的模型并行来说，不同算子的切分方式都不一样
+
+对MLP来说：第一个权重按列切分，第二个权重按行切分，所以X是完整输入到每个GPU中，然后与第一个权重做完计算后结果不需要做AllGather，直接做完Gelu后与第二个权重计算，最后对每个GPU计算得到的结果做AllReduce
+
+![image-20250427203203418](llm serving.assets/image-20250427203203418.png)
+
+为什么不对第一个权重按列切分？因为如果这样那么得到的XA1和XA2就是全量的不完整数据，需要先做一次AllReduce之后才能与第二个权重做计算。除此之外由于需要做Gelu，它可以对部分的完整数据做计算，但是不能对全量的不完整的数据计算，所以这样也需要做AllReduce
+
+![img](llm serving.assets/v2-ece343729db7067dbe8077de45a8acca_r.jpg)
+
+对attention来说：由于attention不同head之间的计算天然就是并行的，所以可以直接按head切分。对wq wk 和wv矩阵按列（也就是QKVdim方向）切分，**一块GPU上负责一个或多个head**；attention之后需要乘以矩阵O，由于QKV是按列切分的，所以O就按行切分，依然是按照QKVdim方向切分
+
+![image-20250427211637298](llm serving.assets/image-20250427211637298.png)
+
+对于Embedding来说：将词表按词表长度的维度进行切分，假设词表中有300个词，现在我们将word embedding拆分到两块GPU上，第一块GPU维护词表[0, 150)，第二块GPU维护词表[150, 299)。当输入X去GPU上查找时，能找到的词，就正常返回词向量，找到不到就把词向量中的全部全素都置0。按此方式查找完毕后，每块GPU上的数据做一次AllReduce，就能得到最终的输入。
+
+![img](llm serving.assets/v2-8f5e622a7bd67810a8f1f4c117eab277_r.jpg)
+
+除了输入层之外，输出层还有一个Embedding层，将hidden_states再映射回词表中。而由于输入和输出共用一个embedding，所以输出层的embedding切分方式也是相同的
+
+![img](llm serving.assets/v2-a559e363b4219b69d3d9196e7872b75b_r.jpg)
+
+
+
+所以Transformer模型并行的结构图如下所示：
+
+![img](llm serving.assets/v2-47883eb0b2eccd72206d92167d645207_1440w.jpg)
+
+![img](llm serving.assets/v2-2b7eb164cff33d47972ce46d3a3a2db2_r.jpg)
+
+![img](llm serving.assets/v2-7d500addd4e1a194a92146b406883b56_r.jpg)
+
+
+
 ## PD分离
 
 PD合并推理：一块GPU上既做prefill又做decode，比如vllm就是在一块GPU上prefill和decode交替进行，一次step要么全是prefill要么全是decode
@@ -202,7 +227,65 @@ PD分离的基本思想：一部分GPU专门做prefill，被称为prefill instan
 - prefill阶段：拥有计算受限的性质（compute-bound），prefill阶段算完KV cache并发给deocde阶段后，理论上prefill就不再需要这个KV cache了
 - decode阶段：拥有存储受限的性质（memory-bound），因为token by token的生成方式，decode阶段要频繁从存储中读取KV Cache，同时也意味着它需要尽可能保存KV cache。
 
+## python语法
 
+装饰器：
+
+- 当解释器遇到@decorator时，装饰器函数会立即被调用，传入被装饰的函数my_function作为参数，然后使用装饰器返回的 `wrapper` 函数替换原函数
+
+  ```python
+  def decorator(func):
+      def wrapper(*args, **kwargs):
+          # 装饰逻辑（函数调用前）
+          result = func(*args, **kwargs)  # 调用原函数
+          # 装饰逻辑（函数调用后）
+          return result
+      return wrapper
+    
+  @decorator
+  def my_function(): ...
+  ```
+
+  等价于：
+
+  ```python
+  my_function = decorator(my_function)
+  ```
+
+
+**pytorch to device方法**：
+
+下面的代码是将key_cache_gpu的数据拷贝到cpu上，并不是移动到cpu上，所以gpu上依然保留原来的数据，key_cache_gpu依然指向原来的数据
+
+```python
+    key_cache_cpu = key_cache_gpu.to("cpu")
+```
+
+所以如果使用下面的方法，那么maybe_quantized_key_cache在to("cpu")后依然在gpu上，那么后面对maybe_quantized_key_cache调用to("cuda")仍然是对GPU上的tensor调用的，所以不会进行任何拷贝，所以测到的时间不是真实的拷贝的时间
+
+```python
+    maybe_quantized_key_cache.to("cpu")
+    maybe_quantized_value_cache.to("cpu")
+    torch.cuda.synchronize() # 确保同步拷贝
+
+    copy_start_time = time.perf_counter_ns()
+    maybe_quantized_key_cache.to("cuda")
+    maybe_quantized_value_cache.to("cuda")
+```
+
+所以应该使用下面的方法：
+
+```python
+    key_cache_cpu = key_cache_gpu.to("cpu")
+    value_cache_cpu = value_cache_gpu.to("cpu")
+    torch.cuda.synchronize() # 确保同步拷贝
+
+    copy_start_time = time.perf_counter_ns()
+    key_cache_gpu = key_cache_cpu.to("cuda")
+    value_cache_gpu = value_cache_cpu.to("cuda")
+```
+
+注意，拷贝后在cpu上和gpu上存在两个副本，如果想将某一个tensor释放，那么就将该变量名覆盖即可，当tensor的引用计数变为0时，就会自动释放内存
 
 ## vLLM v1
 
@@ -220,6 +303,7 @@ docker run --name my_docker --gpus all -it --ipc=host nvcr.io/nvidia/pytorch:23.
   - --rm参数表示创建一次性的容器，退出后自动释放；否则，在容器中使用ctrl-d退出时，容器的内容不会被释放，状态变成exited，表示容器已停止但是并未删除；
   - --name参数表示给非一次性的容器一个名字，以后启动时就可以通过这个名字进行
   - --mount表示把系统上指定的文件挂载到docker中
+  - `docker run -d IMAGE`中的-d参数表示让容器以**后台模式**运行，不会占用当前终端。
 - `docker ps -a`可以查看所有正在运行和停止的docker和它的状态，如果状态为exited则表示容器停止了；如果为up则正在运行
 - `docker ps`查看所有正在运行的docker
 - `docker stop xxxx`表示停止指定名字的容器
@@ -239,15 +323,13 @@ $ sudo usermod -aG docker $USER
 
 - ps aux与ps的区别：后者仅显示**当前用户在当前终端（TTY）** 下启动的进程，并且仅包含基础字段；前者显示**所有用户的进程**，包含系统所有进程的详细状态，所以想要过滤进程时通常使用ps aux | grep
 
-
-
 然后在docker中
 
 ```
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-pip install -e . -v -i https://pypi.mirrors.ustc.edu.cn/simple/ # 如果要修改C++和cuda代码，那么使用这个命令，完全编译
-VLLM_USE_PRECOMPILED=1 pip install --editable . -v -i https://pypi.mirrors.ustc.edu.cn/simple/ # 如果仅仅修改python代码，那么就使用这个命令，可以减少编译时间
+pip install -e . -v -i https://pypi.mirrors.ustc.edu.cn/simple/ # 如果要修改C++和cuda代码，那么使用这个命令，需要较长的编译时间
+VLLM_USE_PRECOMPILED=1 pip install --editable . -v -i https://pypi.mirrors.ustc.edu.cn/simple/ # 如果仅仅修改python代码，那么就使用这个命令，不需要编译，仅仅安装依赖
 ```
 
 如果编译出现问题，那么命令前加上 MAX_JOBS=4
@@ -262,7 +344,15 @@ VLLM_USE_PRECOMPILED=1 pip install --editable . -v -i https://pypi.mirrors.ustc.
   MAX_JOBS=4 CCACHE_NOHASHDIR="true" pip install --no-build-isolation -e . -v -i https://pypi.mirrors.ustc.edu.cn/simple/
   ```
 
-然后使用vscode打开docker，再在docker中打开vllm目录进行调试
+当使用CCACHE反复编译时，只有第一遍需要使用MAX_JOBS=4，后面的直接使用所有核即可
+
+然后使用vscode连接上服务器，在侧边的extensions中下载docker插件，然后在docker栏中找到自己刚才启动的对应的容器，右键后点击attach visual studio code
+
+![image-20250326095937571](llm serving.assets/image-20250326095937571.png)
+
+再在docker中打开vllm目录，在目录下创建一个python文件，调用vllm的接口，然后就可以对vllm进行调试了
+
+<img src="llm serving.assets/image-20250326100210196.png" alt="image-20250326100210196" style="zoom:67%;" />
 
 对vllm v1进行调试：`export VLLM_USE_V1=1`
 
@@ -276,20 +366,78 @@ VLLM_USE_PRECOMPILED=1 pip install --editable . -v -i https://pypi.mirrors.ustc.
 
 - 解决办法：把自己的代码用 `if __name__ == "__main__":`包起来
 
+#### 在其他服务器上pull docker
+
+```
+docker pull reg.docker.alibaba-inc.com/commons/vllm-0.7.3:latest
+```
+
+
+
+#### vllm服务
+
+启动服务：
+
+```bash
+vllm serve meta-llama--Llama-2-7b-chat-hf/ \
+  --disable-log-requests \
+  --trust-remote-code \
+  --enforce-eager \
+  --dtype=half \
+  --tensor_parallel_size 2 \
+  --port=8000
+```
+
+启动client：
+
+```bash
+python3 benchmarks/benchmark_serving.py     --dataset-name random     --num-prompts 1000     --random-input 1000     --random-output 100     --random-range-ratio 0.1     --request-rate 4     --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json     --model meta-llama--Llama-2-7b-chat-hf/     --port 8000
+```
+
+#### 调试pybind
+
+首先在编译的时候要设置为debug模式，由于在setup.py文件中我们可以看到：
+
+![image-20250404214237645](llm serving.assets/image-20250404214237645.png)
+
+所以CMAKE_BUILD_TYPE是由环境变量决定的；所以我们需要在命令行中export CMAKE_BUILD_TYPE=Debug，然后再开始编译
+
+如果设置没有成功，那么编译时会显示build type为relwithdebinfo
+
+![image-20250404205547261](llm serving.assets/image-20250404205547261.png)
+
+如果设置成功了，那么build type就是Debug
+
+![image-20250404205722727](llm serving.assets/image-20250404205722727.png)
+
+编译时出现`'cicc' died due to signal 9 (Kill signal)`是因为编译使用的线程太多了，用完了内存（并且还会导致我的账号被服务器封掉）
+
+
+
 ### EngineCore架构
 
 之前的vllm版本中，接受用户请求、对请求进行预处理、分词、多模态输入处理、对请求调度、在GPU上执行推理、对结果进行de-tokenize、最后将结果返回给用户，这整个过程都是在同一个进程中执行的，然而这其中有大量的CPU overhead，除了中间的在GPU上推理，其余的步骤都是在CPU上执行的，并且它们之间还是串行的；这样的overhead对于比较小的模型来说尤其明显。
+
+在先前vllm版本的推理中，我们经常会发现detokenize（tokenid -> 文本）这个步骤会成为推理瓶颈，特别是遇到长序列的情况。在等待序列做detokenize的过程中，gpu是空转的。现在通过这种拆解，让原来是串行的事情并行化。
 
 所以vllm v1的版本采用了多进程的架构，将API server和LLM的核心功能分开在两个进程上，进程之间使用ZeroMQ进行IPC；
 
 - API server负责接收用户请求，对请求进行预处理、分词，将推理的结果进行de-tokenize并且返回给用户
 - 而另一个进程EngineCore负责LLM的核心功能，主要是在一个循环中对请求进行调度和在GPU上进行推理
 
+简单来说，**就是将请求的pre-process和输出结果的post-process与实际的推理过程拆分在2个不同的进程中**(process0, process1)。Client负责请求的pre-process和输出结果的post-process，EngineCore负责实际的推理过程，不同进程间使用ZMQ来通信数据。
+
 这样就**充分实现了CPU和GPU的重叠，隐藏了CPU的overhead，提高了吞吐量**
+
+对于offline batching和online serving来说，它们会选取不同类型的Client进行运作，但是它们的EngineCore部分运作基本是一致的
+
+#### offline batching
 
 具体的结构是：
 
 ![vllm1 (1)](llm serving.assets/vllm1 (1).png)
+
+![img](llm serving.assets/v2-0d7b3741144d2293ac6d615f2d5f3d01_1440w.jpg)
 
 构造LLM时，会在LLM对象内部构造一个LLMEngine成员
 
@@ -384,11 +532,51 @@ EngineCoreProc对象构造完之后，run_engine_core方法会**在这个EngineC
 
 - 对于MPClient，get_output方法则直接从队列中获取输出即可；因为step由另一个进程的EngineCore执行完了，这样就**实现了add_request（包括接受用户请求、对请求进行预处理、分词）和调度与GPU执行的重叠**。这就是为什么在调试vllm v1的时候，明明一次性add_request了好几个prompt，但是在调度时却显示waiting队列中只有一个req
 
+#### online serving
+
+![img](llm serving.assets/v2-51b07b3369ec1961308544986e104851_1440w.jpg)
+
+EngineCore部分的逻辑与offline batching相比基本相同，主要的区别在于Client的流程
+
+主要区别在于：
+
+- `create asynico.queue() for each req`：**会针对每一个req创建一个异步队列**，这个异步队列将用于存储这个req的输出结果。
+- `register the queue to output_processor`：会把这个req的异步队列注册到output_processor中。
+  - **为什么每个req需要一个单独的队列**：
+    - 在online serving中，req的输出结果是流式的（一块一块地把结果返回给用户），并且用户时常有多轮对话的需求等等。**基于这样的考虑，相比于offline batching对所有req的一次性统一输出，online serving下更有必要将各个req的输出隔离开来，因此才单独针对每个req创建一个用于盛放输出结果的异步队列。**
+- 在`AsyncLLM`上，我们会启动一个异步任务`asyncio.create_task(_run_output_handler())`，这个异步任务上会执行`_run_output_handler()`函数，这个函数的主要作用是异步接受、处理来自EngineCore的模型输出结果，具体流程为：
+  1. 使用get_output_async()函数，持续监听通过output_socket传递来的pickle EngineCoreOutputs，将pickle EngineCoreOutputs decode成 EngineCoreOutputs，再将EngineCoreOutputs装入到output_queue中
+  2. `split output into slices`将output_queue中的数据切成slices，方便后续做流式输出。再将slices数据装入这个req注册在output_processor中、只属于这个req的异步队列。然后output_processor将会以slices为维度，对输出数据做诸如detokenize等的操作。
+  3. 对于一条请求，AsyncLLM将会持续从output_processor中获取它当前的输出结果，返回给用户，直到这条请求推理完毕
+
+![img](llm serving.assets/v2-938e021524fbf1673206faf5cbd1b6fb_r.jpg)
+
+
 ### executor架构
 
 ![vllm_executor](llm serving.assets/vllm_executor.png)
 
-在LLM对象构造时，会构造一个engine_args对象，它有一个参数是`distributed_executor_backend`，可以传入ray、mp、uni等参数，然后使用engine_args对象创建LLMEngine对象时，可以根据`distributed_executor_backend`选择对应类型的executor，传入LLMEngine的构造函数中
+在LLM对象构造时，会构造一个engine_args对象，它有一个参数是`distributed_executor_backend`，可以传入ray、mp、uni等参数，**默认情况下为None**，你当然也可以手动指定。在默认情况下，vllm会根据你的分布式配置（world_size）和你所使用的平台特征(cuda、neuron、是否安装/初始化/配置了ray等)来自动决定--distributed-executor-backend的取值。
+
+这四种类型的Executor分别为：
+
+- mp：MultiprocExecutor
+
+  适用场景：单机多卡。当单机的卡数满足分布式配置，且没有正在运行的ray pg时，默认使用mp。在此情况下，**Executor成为一个主进程，其下的若干个workers构成了它的子进程们**
+
+- ray：RayDistributedExecutor
+
+  适用场景：多机多卡。在ray的情况下，Executor成为一个ray driver process，其下管控着若干worker process
+
+- uni：UniProcExecutor
+
+  适用场景：单卡或 Neuron环境
+
+- external_launcher：ExecutorWithExternalLauncher
+
+  适用场景：想要用自定义的外部工具（例如Slurm）来做分布式管理
+
+然后使用engine_args对象创建LLMEngine对象时，可以根据`distributed_executor_backend`选择对应类型的executor，传入LLMEngine的构造函数中
 
 ![image-20250321201220635](llm serving.assets/image-20250321201220635.png)
 
@@ -410,31 +598,133 @@ EngineCoreProc对象构造完之后，run_engine_core方法会**在这个EngineC
 
 ![image-20250321214729579](llm serving.assets/image-20250321214729579.png)
 
-如果选择了backend是mp（多进程worker），那么这里调用的是`MultiprocExecutor`的 `_init_executor`方法，它会先在EngineCore进程中创建一个rpc_broadcast_mq的消息队列，用来将EngineCore进程的调度的结果广播给其他进程的worker。
+如果选择了backend是mp（多进程worker），那么这里调用的是`MultiprocExecutor`的 `_init_executor`方法，它会**先在EngineCore进程中创建一个rpc_broadcast_mq的消息队列**，用来将EngineCore进程的调度的结果广播给其他进程的worker。
 
-然后会遍历world_size，对每个rank都创建一个worker进程，并将创建后的worker加入到队列中记录下来
+- 该队列存储着Executor要broadcast给各个workers的【小数据(<=10MB)】，而【大数据(>10MB)】则不会进入此队列，而是通过zmq socket进行传输。
+- **每条数据可以被粗糙理解成是`(method, data)`的形式，data = 数据本身，method=你期望worker上调用什么样的方法来处理这条数据。**
+
+然后会遍历world_size，对每个rank都调用make_worker_process方法创建一个worker进程，并将创建后的worker加入到队列中记录下来。
+
+**在创建每个子进程时，我们会通过`self.rpc_broadcast_mq.export_handle()`获取rpc_broadcast_mq的handler，也就是输入队列的句柄，然后将`rpc_broadcast_mq_handler`传递给子进程**，这里你可以粗糙将“handler（句柄）”理解成是一个“地址”，有了这个地址，每个子进程才知道要去哪里找到并【连接】这个队列，以此读到队列中的数据
 
 ![image-20250322100236200](llm serving.assets/image-20250322100236200.png)
 
-make_worker_process方法主要的任务就是创建另一个进程并在其中构造worker，并且还要创建一个worker_response_mq消息队列，用来接收worker的执行结果。然后将worker进程和消息队列打包在一起作为worker进程在EngineCore进程本地的一个Handle返回
+make_worker_process方法主要的任务：
+
+- TLDR：创建另一个进程并在其中构造worker，并且还要创建一个worker_response_mq消息队列，用来接收worker的执行结果。然后将worker进程和消息队列打包在一起作为worker进程在EngineCore进程本地的一个Handle返回
 
 ![image-20250322100547400](llm serving.assets/image-20250322100547400.png)
 
-EngineCore在另一个进程中构造worker的逻辑与之前的主进程在另一个进程中构造EngineCore的逻辑一样：
+具体来说，make_worker_process首先在另一个进程中构造worker，这里的逻辑与之前的主进程在另一个进程中构造EngineCore的逻辑一样：
 
-在EngineCore进程中，创建一个后台进程，执行WorkerProc类中的worker_main静态方法，在此方法中，先构造一个WorkerProc对象，然后调用此对象的worker_busy_loop方法，此方法中同样是一个死循环
+在EngineCore进程中，创建一个后台进程，执行WorkerProc类中的worker_main静态方法，
+
+![image-20250502173133529](llm serving.assets/image-20250502173133529.png)
+
+在worker_main方法中，先构造一个WorkerProc对象，然后调用此对象的worker_busy_loop方法，此方法中同样是一个死循环
 
 ![image-20250321205832248](llm serving.assets/image-20250321205832248.png)
 
-在WorkerProc对象构造时，会创建两个消息队列，一个是rpc_broadcast_mq，用来从EngineCore接收调度的结果；一个是worker_response_mq，用来将模型的执行结果发送给EngineCore；然后发送信号给EngineCore进程，告诉他Worker的消息队列已经准备好了，EngineCore可以开始进行调度了
+WorkerProc对象的结构为：
+
+![image (1)](llm serving.assets/image (1).png)
+
+在WorkerProc对象构造时，会先创建一个WorkerWraperBase类的对象，每个Worker实例都有属于自己的WorkerWrapper。你可以将它形象理解成是一个worker的manager，它负责管控一个worker的生命周期（创建->销毁）、所占资源、扩展功能（例如在rlhf场景下的一些功能）等等。
+
+然后在WorkerProc中会维护两个消息队列，
+
+- 一个是rpc_broadcast_mq，这里是通过从EngineCore传过来的**`rpc_broadcast_mq_handler`句柄，连接上了EngineCore中model_executor的`rpc_broadcast_mq`队列**，这样它就能从这个队列中读取(method, data)数据。注意，**这里说的是【连接】而不是创建**，调用的接口是`MessageQueue.create_from_handle`接口
+- 一个是`worker_response_mq`，这个才是每个worker自己【创建】的队列，直接使用MessageQueue的构造函数创建。用来将模型的执行结果发送给EngineCore。同样也会产出`worker_response_mq_handler`这个句柄。后续**这个句柄将通过zmq socket传送给Executor**，让Executor可以连接上这个队列，这样Executor就可以获得每个worker的输出结果
+
+然后将worker_response_mq_handler和ready信号发送给EngineCore进程，告诉他Worker的消息队列已经准备好了，EngineCore可以开始进行调度了
 
 ![image-20250321210254249](llm serving.assets/image-20250321210254249.png)
 
-然后开始执行worker的init_device函数：此函数负责初始化设备的相关信息，**比如根据当前worker的rank找到它所属的device**，以及清空该device的显存，获取该device的显存大小
+注意，这里在WorkerProc和EngineCoreProc之间除了有消息队列messageQueue之外，还依然使用了ZMQ socket来进行进程间的通信，例如**这里在model_executor调用的make_worker_process和WorkerProc的构造函数之间就使用了ready_socket进行通信**，主要用来**让worker进程向Executor发送ready信号 + worker_response_mq_handler**（ModelExecutor向worker进程发送的worker_broadcast_mq_handler不需要通过socket，因为直接通过函数参数传递过去了）
+
+- EngineCore端
+
+  ![image-20250502183350943](llm serving.assets/image-20250502183350943.png)
+
+- WorkerProc端：
+
+  ![image-20250502183454043](llm serving.assets/image-20250502183454043.png)
+
+#### 进程通信
+
+在vLLM中MessageQueue的设计方式就是：
+
+- 对于小数据(<=10MB)，MessageQueue使用ShmRingBuffer(环形共享缓存)来做数据传输，其中Shm即shared_memory，而ring是使用环形的方式往shm中读写数据
+- 对于大数据(>10MB)，vllm使用zmq socket即这里的local_socket来做数据传输。
+
+![image-20250505201236446](llm serving.assets/image-20250505201236446.png)
+
+使用shm的好处是不同的进程都从同一块共享内存(shm)上直接读取，这样数据不需要从一个进程的地址空间复制到另一个进程的的地址空间，可以实现数据的零拷贝。
+
+但是由于shm是一块预分配的固定的内存大小，在实际使用场景中，可能需要传输的数据量本身就不大，只是会偶发出现一些【大数据】传输的情况，因此如果我们预留较大的shm来应对这些偶发情况会造成内存的浪费。所以我们额外使用zmq socket来处理这些较大数据的传输情况
+
+vLLM中ShmRingBuffer的实现方式：
+
+由于在vLLM中MessageQueue主要使用在Engine和worker间通信的场景中，我们称每次通信的内容为一个chunk。在TP的情况下，通常会有一个Engine和多个worker，Engine向worker通信使用broadcast_mq，每个chunk有一个writer和多个reader；worker向Engine通信时使用response_mq，每个chunk有一个writer和一个reader。所以**对于一个chunk，我们总有1个writer，和1个或若干个readers**。
+
+- Model_executor的broadcast_mq的**reader的数量由world_size（实际上是TP * PP的大小，也就是worker的数量）决定，**具体来说等于world_size + 1，
+
+  ![image-20250505200814554](llm serving.assets/image-20250505200814554.png)
+
+- Worker的response_mq的reader数量就是1
+
+  ![image-20250505213416357](llm serving.assets/image-20250505213416357.png)
+
+所以ShmRingBuffer的设计方式是：在shared_memory中预分配一块固定大小的空间，一部分作为chunk数组，vLLM中默认chunk数量是10个，每个chunk大小为10MB；一部分存放chunk数组中每个chunk对应的metadata，metadata就是1 + n_readers个标志位，1代表written_flags，用来指示该chunk是否已经被写入了；n_readers代表read_flags，指示该chunk是否被对应的readers读取了。
+
+![image-20250505201905001](llm serving.assets/image-20250505201905001.png)
+
+在MessageQueue中，构造了ShmRingBuffer后还会构造一个local_socket。然后将current_idx设为0，这是表示当前MessageQueue使用到ShmRingBuffer中的哪个chunk了，每当writer对一个chunk写完之后就会将自己这边的MessageQueue的current_idx加一，当reader对一个chunk读完之后也会将自己的MessageQueue的current_idx加一，所以始终能对得上
+
+- 实际上MessageQueue中存在两种zmq socket：local_socket和remote_socket，前者用于单机内的通信（writer和readers在一台node内），后者用于多机间的通信（writer和readers不在一台内）。当前我们以MultiprocExecutor这种单机场景为例，所以我们提到的zmq socket都是指local_socket。
+
+![image-20250505205753152](llm serving.assets/image-20250505205753152.png)
+
+然后将构造者这边的MessageQueue的`_is_writer`设为True，`_is_local_reader`设为False，并且**将ShmRingBuffer的handle和local_socket的相关信息打包成Handle返回给用户，这样让用户可以传递给其他进程，使用该Handle中的信息与构造者的MessageQueue建立连接**（比如ShmRingBuffer的handle中记录了shared_memory的名字和大小）
+
+![image-20250505210139667](llm serving.assets/image-20250505210139667.png)
+
+其他的进程接收到Handle之后就可以使用MessageQueue的create_from_handle方法连接上构造者的MessageQueue
+
+![image-20250505210815746](llm serving.assets/image-20250505210815746.png)
+
+上层的Engine和worker就可以通过MessageQueue的enqueue和dequeue方法来进行通信
+
+![image-20250505211313264](llm serving.assets/image-20250505211313264.png)
+
+enqueue方法先将传入的对象序列化，然后获取当前在ShmRingBuffer中对应的chunk，如果大小超过了chunk可以容纳的大小，那么就在chunk上记录一下发生了overflow，然后将数据通过local_socket发送出去；如果没有overflow，那么就直接保存在chunk上
+
+![image-20250505211347588](llm serving.assets/image-20250505211347588.png)
+
+dequeue方法也是先从ShmRingBuffer中获取当前对应的chunk，然后检查该chunk是否发生了overflow，如果发生了则从local_socket中读取数据；否则就从chunk中读取数据并反序列化
+
+![image-20250505211857479](llm serving.assets/image-20250505211857479.png)
+
+这里reader和writer获取chunk的方式是：先根据current_idx获取当前对应的chunk，然后在循环中反复轮询该chunk是否满足读或写的条件。一个chunk可以写的条件是：该chunk没有被写过或者写过了但是已经被所有reader读完了；
+
+- 如果不满足条件则先让出CPU给其他线程运行一会再接着轮询（因为python的一个进程中的线程不能并行，所以如果某个线程忙等那么其他线程永远无法得到运行）。
+- 如果满足条件则先将chunk标记为未写（？）然后将chunk返回给writer（这里应该是使用了协程），writer写完后再将所有的read_flags清空再将chunk标记为写完了。最后将current_idx递增
+
+![image-20250505212247349](llm serving.assets/image-20250505212247349.png)
+
+![image-20250505212820716](llm serving.assets/image-20250505212820716.png)
+
+所以由此可见，python的multi thread是假multi，所以这里使用了multi process，只不过增加了ipc通信的时间
+
+#### epilogue
+
+![image-20250505213618143](llm serving.assets/image-20250505213618143.png)
+
+Worker的mq和socket构造完毕后就开始执行worker的init_device函数：此函数负责初始化设备的相关信息，**比如根据当前worker的rank找到它所属的device**，将它绑到指定的卡上，并对它做分布式环境初始化（即制定它的分布式通信group）。以及清空该device的显存，获取该device的显存大小等
 
 ![image-20250322162102956](llm serving.assets/image-20250322162102956.png)
 
-最后在worker中构造GPUModelRunner对象
+最后在worker中构造GPUModelRunner对象，一个worker实例下维护着一个ModelRunner实例，这个实例上维护着模型权重分片（model weights sharding）、这块卡上的kv_caches、attn_backend等一系列的具体模型信息，**它将最终负责模型权重的加载(load_model)，并执行实际的推理过程。**
 
 ![image-20250321211655433](llm serving.assets/image-20250321211655433.png)
 
@@ -442,9 +732,13 @@ worker的GPUModelRunner成员主要负责运行模型，在构造函数中会维
 
 ![image-20250321212404402](llm serving.assets/image-20250321212404402.png)
 
-执行完`init_device`后开始执行worker的`load_model`函数，此函数负责导入模型
+执行完`init_device`后开始执行worker的`load_model`函数，**当ModelRunner实际去加载这个worker所要的模型分片**
 
-WorkerProc对象构造完毕后，开始执行worker_busy_loop方法，此方法中就是在一个死循环中不断尝试从rpc_broadcast_mq中获取EngineCore进程广播来的方法名，获取到了之后，就通过self.worker对象执行该方法，然后将执行的结果加入到worker进程的worker_response_mq队列中
+WorkerProc对象构造完毕后，开始执行worker_busy_loop方法，
+
+![image-20250502184227076](llm serving.assets/image-20250502184227076.png)
+
+此方法中就是在一个死循环中不断尝试从rpc_broadcast_mq中获取EngineCore进程广播来的方法名，获取到了之后，就通过self.worker对象执行该方法，然后将执行的结果加入到worker进程的worker_response_mq队列中
 
 ![image-20250322103541331](llm serving.assets/image-20250322103541331.png)
 
@@ -460,7 +754,9 @@ WorkerProc对象构造完毕后，开始执行worker_busy_loop方法，此方法
 
 ![image-20250322105633239](llm serving.assets/image-20250322105633239.png)
 
-所以V1与V0的MultiprocExecutor最主要的区别在于：V0中的EngineCore和worker0在同一个进程，这样做可以在向各个工作进程广播输入数据时减少进程间的通信开销，但这种设计导致了不对称架构，增加了系统复杂性。如下面所示：下面是V0的MultiprocExecutor，它将除了worker0之外的worker构造在独立的进程中，而将worker0与Enginecore放在同一个进程中
+所以V1与V0的MultiprocExecutor最主要的区别在于：V0中的EngineCore和worker0在同一个进程，这样做可以在向各个工作进程广播输入数据时减少进程间的通信开销，但这种设计导致了不对称架构，增加了系统复杂性；并且worker0既要负责调度和数据分发、又要负责实际的推理计算。如此一来，**各个workers间存在负载不均的问题，而worker0将成为性能的瓶颈**。
+
+如下面所示：下面是V0的MultiprocExecutor，它将除了worker0之外的worker构造在独立的进程中，而将worker0与Enginecore放在同一个进程中
 
 ![image-20250322164846956](llm serving.assets/image-20250322164846956.png)
 
@@ -468,35 +764,268 @@ WorkerProc对象构造完毕后，开始执行worker_busy_loop方法，此方法
 
 ![img](llm serving.assets/v1_tp_architecture.png)
 
+#### 模型的导入
+
+在LLMEngine的from_engine_args函数中初始化了vllm的config
+
+![image-20250326211606543](llm serving.assets/image-20250326211606543.png)
+
+其中包括以下内容
+
+`vllm_config`：
+
+- `model_config`：
+
+- `cache_config`：
+
+- `parallel_config`：
+
+  ```bash
+  pipeline_parallel_size=1,tensor_parallel_size=1,data_parallel_size=1,data_parallel_rank=0,data_parallel_master_ip='127.0.0.1',data_parallel_master_port=0,enable_expert_parallel=False,max_parallel_loading_workers=None,distributed_executor_backend='uni',worker_cls='vllm.v1.worker.gpu_worker.Worker',,world_size=1,world_size_across_dp=1,rank=0
+  ```
+
+- `scheduler_config`：
+
+  ```bash
+  runner_type='generate',max_num_batched_tokens=8192,max_num_seqs=1024,max_model_len=2048,
+  max_num_partial_prefills=1,max_long_partial_prefills=1,long_prefill_token_threshold=0,
+  enable_chunked_prefill=True,is_multimodal_model=False,max_num_encoder_input_tokens=8192,
+  encoder_cache_size=8192,preemption_mode=None,num_scheduler_steps=1,multi_step_stream_outputs=True,policy='fcfs',scheduler_cls='vllm.v1.core.scheduler.Scheduler'
+  ```
+
+- `device_config`：
+
+- `load_config`：
+
+  ```bash
+  load_format=<LoadFormat.AUTO: 'auto'>,download_dir=None,model_loader_extra_config=None,
+  use_tqdm_on_load=True
+  ```
+
+- `speculative_config`：
+
+- `decoding_config`：
+
+  ```bash
+  guided_decoding_backend='xgrammar',reasoning_backend=None
+  ```
+
+- `quant_config`：
+
+- `compilation_config`：
+
+  ```bash
+  {"level":3,"custom_ops":["none"],
+  "splitting_ops":["vllm.unified_attention","vllm.unified_attention_with_output"],
+  "use_inductor":true,
+  "compile_sizes":[],
+  "use_cudagraph":true,"cudagraph_num_of_warmups":1,
+  "cudagraph_capture_sizes":[512,504,496,488,480,472,464,456,448,440,432,424,416,408,400,392,384,376,368,360,352,344,336,328,320,312,304,296,288,280,272,264,256,248,240,232,224,216,208,200,192,184,176,168,160,152,144,136,128,120,112,104,96,88,80,72,64,56,48,40,32,24,16,8,4,2,1],
+  "max_capture_size":512}
+  ```
+
+- `kv_transfer_config`：
+
+- `instance_id`：
+
+在WorkerProc初始化的时候会load_model
+
+![image-20250327094348339](llm serving.assets/image-20250327094348339.png)
+
+在其中再调用WorkerProc内部的`model_runner`（`GPUModelRunner`类）的load_model方法
+
+![image-20250327095748327](llm serving.assets/image-20250327095748327.png)
+
+![image-20250327111854809](llm serving.assets/image-20250327111854809.png)
+
+![image-20250327111926814](llm serving.assets/image-20250327111926814.png)
+
+在`_initialize_model`中先获取到模型的结构，比如这里的结构是`LlamaForCausalLM`
+
+![image-20250327100112160](llm serving.assets/image-20250327100112160.png)
+
+LlamaConfig（实际上是`vllm_config.model_config.hf_config`）的内容是：
+
+```bash
+LlamaConfig {
+           "_name_or_path": "./meta-llama--Llama-2-7b-chat-hf",
+           "architectures": [
+             "LlamaForCausalLM"
+           ],
+           "attention_bias": false,
+           "attention_dropout": 0.0,
+           "bos_token_id": 1,
+           "eos_token_id": 2,
+           "head_dim": 128,
+           "hidden_act": "silu",
+           "hidden_size": 4096,
+           "initializer_range": 0.02,
+           "intermediate_size": 11008,
+           "max_position_embeddings": 2048,
+           "mlp_bias": false,
+           "model_type": "llama",
+           "num_attention_heads": 32,
+           "num_hidden_layers": 32,
+           "num_key_value_heads": 32,
+           "pad_token_id": 0,
+           "pretraining_tp": 1,
+           "rms_norm_eps": 1e-06,
+           "rope_scaling": null,
+           "rope_theta": 10000.0,
+           "tie_word_embeddings": false,
+           "torch_dtype": "bfloat16",
+           "transformers_version": "4.49.0",
+           "use_cache": true,
+           "vocab_size": 32000
+         }
+```
+
+获取到arch后再去模型的注册器（ModelRegistery）中获取vLLM所有支持的模型结构（archs），并且判断当前导入的模型是否在其中，如果在的话就从ModelRegistery中获取该模型的class
+
+![image-20250327103907855](llm serving.assets/image-20250327103907855.png)
+
+`ModelRegistry`是一个全局变量，在该文件被import的时候初始化
+
+<img src="llm serving.assets/image-20250327110054378.png" alt="image-20250327110054378" style="zoom:67%;" />
+
+它负责从`_VLLM_MODELS`字典中获取vLLM所有支持的模型的结构、模型的实际的名字以及模型在vLLM中的class的名字，然后将它们维护在`ModelRegistry`中。
+
+`_VLLM_MODELS`就像下面这样
+
+<img src="llm serving.assets/image-20250327110424371.png" alt="image-20250327110424371" style="zoom:67%;" />
+
+这些类就存放在vllm/model_executor/model/目录下	
+
+![image-20250327110803216](llm serving.assets/image-20250327110803216.png)
+
+比如对于所导入的llama模型来说，它对应的class是`LlamaForCausalLM`，该类就在model_executor/model/llama.py文件中
+
+**此时获取到了导入的模型的class了，然后使用vllm_config对该class进行实例化，获得model的对象**
+
+![image-20250327112124010](llm serving.assets/image-20250327112124010.png)
+
+下面就是各个模型自己的初始化过程了。对于本例中的llama模型来说，初始化时会首先创建一个embedding层，然后再给自己的每一层都创建一个layer
+
+![image-20250328104522439](llm serving.assets/image-20250328104522439.png)
+
+在make_layers函数中使用给定的layer_type类给每一层layer创建一个layer对象，这里还将流水线并行考虑到其中了，为当前device上没有的layer创建一个空的layer对象作为占位符
+
+![image-20250327144147842](llm serving.assets/image-20250327144147842.png)
+
+这里的layer_type就是LlamaDecoderLayer类型，LlamaDecoderLayer初始化与pytorch训练模型时初始化的方式一样，根据config中的配置信息初始化一个decoderLayer中基本的结构，包括attention、attention前后的两个layernorm以及一个mlp
+
+![image-20250327144434887](llm serving.assets/image-20250327144434887.png)
+
+LlamaDecoderLayer中同样也有forward方法，负责按顺序调用input_layernorm、self_attn、post_attention_layernorm和mlp，然后将结果返回
+
+<img src="llm serving.assets/image-20250327145100608.png" alt="image-20250327145100608" style="zoom:67%;" />
+
+然后在LlamaDecoderLayer外面是LlamaModel类的forward，遍历LlamaModel的self.layers list，对每一个layer调用forward，也就是LlamaDecoderLayer的forward方法
+
+![image-20250327153414225](llm serving.assets/image-20250327153414225.png)
+
+如果要在forward时对每个算子进行调试，那么需要将llm的参数的enforce-eager参数设为true，也就是禁用cuda graph，只有这样才能进入算子的断点
+
+![image-20250327174624082](llm serving.assets/image-20250327174624082.png)
+
+### PP DP TP的实现
+
+![image-20250504160201121](llm serving.assets/image-20250504160201121.png)
+
+在构造LLM对象时会构造EngineArgs对象，其中会指定EngineArgs的参数。这里构造LLM时只能指定tensor_paraller_size，PP和DP的size则无法通过LLM类的接口指定，只能在EngineArgs构造时手动指定。默认的DP、PP和TP的size都为1
+
+- 目前vLLM v1不支持PP，如果使用PP并且没有ray作为后端就会退化到v0
+- 使用DP=2和TP=2时疑似会导致死锁
+
+![image-20250504155815947](llm serving.assets/image-20250504155815947.png)
+
+![image-20250504155616708](llm serving.assets/image-20250504155616708.png)
+
+在LLMEngine中创建vllm_config时，其中会包括ParrallelConfig，其中维护了分布式并行执行的一些配置，除了EngineArgs中的dp pp tp的size之外，还进一步包括了dp的rank以及world_size等。world_size是TP * PP，而world_size_across_dp是包括了DP的world_size，等于TP * PP * DP
+
+![image-20250504160808047](llm serving.assets/image-20250504160808047.png)
+
+在ParallelConfig初始化时，如果没有指定使用ray作为distributed_executor_backend并且当前节点的GPU数量可以容纳world_size，那么就使用mp作为`distributed_executor_backend`
+
+随后依然是构造SyncMPClient，其中为每个dp rank都创建一个CoreEngine对象
+
+![image-20250504212636687](llm serving.assets/image-20250504212636687.png)
+
+<img src="llm serving.assets/image-20250504212704597.png" alt="image-20250504212704597" style="zoom:67%;" />
+
+每个CoreEngine对象中都会调用BackgroundProcHandle来创建后台进程，也就是EngineCoreProc进程。
+
+![image-20250504212809680](llm serving.assets/image-20250504212809680.png)
+
+这里创建进程的方式默认调用的是fork，某些特殊情况下会调用spwan（在get_mp_context函数中判断）
+
+```python
+proc = multiprocessing.context.ForkContext.process(target_fn, process_kwargs, process_name)
+proc.start()
+```
+
+**在proc.start()执行的时候，才开始创建子进程**；我的猜测这里的start函数实际上是对os的fork系统调用的包装，调用完fork之后判断一下返回的pid，如果是父进程的话直接返回到BackgroundProcHandle函数；如果是子进程的话则跳转到target_fn函数执行，这里target_fn函数就是run_engine_core函数
+
+这也是为什么新的子进程的调用栈和父进程几乎一样的原因
+
+![image-20250504214212023](llm serving.assets/image-20250504214212023.png)![image-20250504214219271](llm serving.assets/image-20250504214219271.png)
+
+注意，这里python的fork机制继承了Linux/POSIX `fork()` 本身就有的“单线程复制 + 整块地址空间继承”行为，也就是fork只会保留调用的线程，创建的新进程中其他的线程不存在，但是同时会保留其他线程的栈和堆空间中的所有数据，导致锁状态也会被继承，所以其他线程持有的锁无法被释放，新的线程获取这些锁就会导致死锁。比如父进程在多线程状态下 fork，子进程里一调用 `printf()` 就锁在内部互斥量上
+
+但是这种情况对python来说会更加危险，因为：
+
+- CPython 自身锁很多：GIL、对象引用计数锁、IO 层互斥、`logging`/`queue` 的内部锁……
+- 纯 C 程序通常 `fork()` ➜ 立刻 `exec()`，把老内存全扔掉；
+
+GIL 是一把进程级互斥锁，它保证 同一时刻只有一个原生线程在执行 Python 字节码，从而保护对所有 Python 对象（特别是对其引用计数）的并发访问安全
+
+
+
+
+
 ### kv cache的初始化
 
 在engine/core.py中，EngineCore类在初始化完Executor后，就紧接着对KV cache进行初始化
 
 ![image-20250313134716651](llm serving.assets/image-20250313134716651.png)
 
-首先会调用`determine_available_memory`函数，获取每个worker所在的device的最多可以给kv cache分配多少显存，这个的计算方式是：先使用dummy输入在device上进行一次前向，得到模型峰值的显存使用量，然后将device的总显存量乘以`gpu_memory_utilization`再减去峰值显存使用量，就能得到该device上最多可以给kv cache分配多少空间。
+首先调用`get_kv_cache_spec`方法，该方法解析模型中的每个attention模块的kv cache格式，从而生成每个attention模块的kv cache的规格
+
+![image-20250328142644395](llm serving.assets/image-20250328142644395.png)
+
+每个attention模块的spec中包括了page_size_bytes，**代表每个attention的一个kv cache block的bytes大小**，比如block_size是16，num_heads是32，head_size是128，kv cache的数据类型是bf16，那么page_size_bytes就是262144
+
+![image-20250328143038947](llm serving.assets/image-20250328143038947.png)
+
+然后会调用`determine_available_memory`函数，获取每个worker所在的device的最多可以给kv cache分配多少显存，这个的计算方式是：先使用dummy输入在device上进行一次前向，得到模型峰值的显存使用量，然后将device的总显存量乘以`gpu_memory_utilization`再减去峰值显存使用量，就能得到该device上最多可以给kv cache分配多少空间。
 
 然后再调用`get_kv_cache_config`获取kv cache的各种配置信息
 
 ![image-20250313134945116](llm serving.assets/image-20250313134945116.png)
 
-配置信息的计算：首先计算在给定的available_memory和模型结构（模型的每一层的kv cache block的大小）下，系统中可以有多少个KVCacheBlock
+配置信息的计算：首先计算在给定的available_memory和模型结构（模型的每一个attention模块的kv cache block的大小，也就是之前的page_size_bytes）下，系统中可以有多少个KVCacheBlock
 
-![image-20250313135151314](llm serving.assets/image-20250313135151314.png)
+![image-20250328143517716](llm serving.assets/image-20250328143517716.png)
 
 然后获取到系统中的KVCacheBlock的数量后，调用initialize_from_config根据这些配置信息为kv cache分配空间；
 
-在worker/gpu_model_runner.py文件中，给每一层layer分配大小为**(2， num_blocks, block_size, kv_head, head_size)**的torch tensor， 其中num_block即为最大的cache block数量，block_size是一个cache block的token个数
+在worker/gpu_model_runner.py文件中，给每一层layer分配大小为**(2， num_blocks, block_size, kv_head, head_size)**的torch tensor，这里是(2, 729, 16, 32, 128)。
 
-![image-20250313144248152](llm serving.assets/image-20250313144248152.png)
+![image-20250328144009722](llm serving.assets/image-20250328144009722.png)
 
 ![image-20250313150749180](llm serving.assets/image-20250313150749180.png)
 
-然后将这些kv cache维护在GPUModelRunner的self.kv_caches中，它是一个tensor的list，维护了每一层layer对应的kv cache tensor，推理时可以根据layer的层数找到对应的kv cache
+上面得到的kv_cache是每一层layer的名字到kv cache tensor的映射，然后还要将这些kv cache绑定到GPUModelRunner的self.kv_caches中，它是一个tensor的list，维护了每一层layer对应的kv cache tensor。
 
-![image-20250313150432358](llm serving.assets/image-20250313150432358.png)
+![image-20250328144913420](llm serving.assets/image-20250328144913420.png)
 
-![image-20250313150812254](llm serving.assets/image-20250313150812254.png)
+然后此函数还负责**将kv_cache绑定到之前构造的model中的每一层的attention模块中**：通过layer_name可以在forward_context中定位到model中对应的attention模块，然后将kv_cache tensor绑定到attention对象的kv_cache中
+
+![image-20250328145039365](llm serving.assets/image-20250328145039365.png)
+
+![image-20250328145634388](llm serving.assets/image-20250328145634388.png)
+
+
 
 ### Scheduler的初始化
 
@@ -532,6 +1061,12 @@ WorkerProc对象构造完毕后，开始执行worker_busy_loop方法，此方法
 ![image-20250313154850272](llm serving.assets/image-20250313154850272.png)
 
 所以使用了prefix cache之后，系统中kv cache的整个运转流程是：对于正在运行的req来说，它的kv cache全部保留，不在free_block_queue中，不允许被驱逐；如果该req被抢占，那么它的kv cache被放入free_block_queue中，可以被驱逐，但是不会在被抢占的瞬间被驱逐；然后用户对block_pool进行申请或释放时，会对free_block_queue按照LRU策略进行分配或释放，释放block时放到free_block_queue的最后，分配时从free_block_queue的头部分配，被分配的块有可能是被抢占的req的block，那么此时该req的kv cache才会被驱逐
+
+所以这里与sglang一样，没有分配固定大小的内存池作为历史kv cache block的缓存，而是让正在运行的请求的内存申请和已缓存的token在一个池子中，当一次调度的batch比较大的时候，会将历史的cache驱逐，如果历史的cache驱逐完了，再驱逐running的req
+
+> sglang：请注意，我们不会预先分配固定大小的内存池作为缓存。相反，我们让已缓存的令牌和当前运行的请求共享同一内存池。因此，系统会动态地为缓存和正在运行的请求分配内存。当有足够的等待请求运行时，系统将驱逐所有已缓存的令牌，以支持更大的批处理大小。
+
+
 
 #### 调度队列
 
@@ -680,6 +1215,86 @@ num_new_blocks = (num_required_blocks - len(req_blocks) -
 
 在worker/gpu_model_runner.py中，GPUModelRunner对象的execute_model函数用来对一次调度的结果执行推理
 
+由于在正常的推理过程中，相邻的step所调度的req大部分都是相同的，可能会偶尔有几个新增的或者被抢占的req，所以V1**在每个worker的GPUModelRunner中都保存了每一次调度的结果的state和持久化的batch**，worker下一次接受到EngineCore传来的scheduler_output时只需要在 `_update_states`中更新自己的state和持久化的batch，不需要从头创建，并且EngineCore发送scheduler_output也只需要增量更新，也就是说scheduler_output中只需要包含被调度的token，而不需要包含该req此前的所有计算过的token
+
+所以GPUModelRunner中最重要的两个结构：
+
+- request states：GPUModelRunner中缓存的states实际上就是一个req id到`CachedRequestState`对象的字典，`CachedRequestState` **对象中主要包括该req的所有token id（分成prompt_token_ids和output_token_ids两个list存储），该req映射的所有的block_ids，以及采样的参数**`sampling_params`。**这个requests字典不仅仅包括此次要计算的req，还缓存了该worker上所有曾经调度过并且没有结束的req，也就是说包括了被抢占的req**，这样当它被恢复的时候就不需要重新将计算过的token传送到worker中了。
+
+  ![image-20250328210958960](llm serving.assets/image-20250328210958960.png)
+
+  ![image-20250328211247444](llm serving.assets/image-20250328211247444.png)
+
+- persistent batch：是一个InputBatch对象，它的内容就是此次execute_model需要计算的所有req的`CachedRequestState`对象的展平后相同的成员放在同一个数组中，如果说**self.requests是一个结构体数组，那么InputBatch就是数组结构体**。具体来说，**InputBatch构造时会按照max_num_reqs和max_model_len提前给这些数组分配一个足够大的buffer**，包括token_ids（默认形状为（1024,2048），表示每个req对应的token id），num_tokens，num_computed_tokens，以及采样的参数（将每个采样的参数都单独用一个数组表示）
+
+  ![image-20250329145338615](llm serving.assets/image-20250329145338615.png)
+
+  ![image-20250329145402255](llm serving.assets/image-20250329145402255.png)
+
+  以及还有一个BlockTable对象，BlockTable对象的内部实际上有三个数据结构，形状都是（max_num_reqs，max_num_blocks_per_req），默认情况下是（1024，128）；它们三个存储的内容和形状都是相同的，只不过一个是GPU上的torch tensor，一个是CPU上的torch tensor，一个是CPU上的numpy数组
+
+  <img src="llm serving.assets/image-20250318133108427.png" alt="image-20250318133108427" style="zoom:67%;" />
+
+  
+
+所以worker在`execute_model`中首先调用`_update_states`函数使用接收到的scheduler_output对自己缓存的request state进行更新，每次更新完state之后还要对input_batch进行更新。更新主要分为四个步骤：
+
+1. 根据scheduler_output中记录的上一次调度中结束的req id（`scheduler_output.finished_req_ids`），将自己本地的state（即`self.requests`字典）中的对应req删除，同时将它们从input_batch中删除
+
+   ![image-20250329130643255](llm serving.assets/image-20250329130643255.png)
+
+2. 根据scheduler_output中记录的此次调度的req id和input_batch中的req id的对比，得到上一次调度了但是此次没有调度的req id，它们就是被抢占的req。**注意，这里仅仅将他们从持久化的input_batch中移除，但是他们的state继续保留在self.requests中，因为它们在未来最终还是会被调度**
+
+   ![image-20250329130847228](llm serving.assets/image-20250329130847228.png)
+
+3. 根据scheduler_output中记录的此次调度中新增的req（`scheduler_output.scheduled_new_reqs`），将该req的信息（主要包括token id、sampling params和block_ids）包装成`CachedRequestState`对象加入到`self.requests`字典中。同样，这里也需要将新增的req对象的数据添加到input_batch中，不过并没有在这里立马添加，而是先将req_id记录下来
+
+   ![image-20250329133817440](llm serving.assets/image-20250329133817440.png)
+
+4. 根据scheduler_output中记录的之前被调度过、并且此次继续调度的req（`scheduler_output.scheduled_cached_reqs`），使用该req的信息更新本地的self.requests字典中缓存的对应req id的`CachedRequestState`信息，主要包括将req新增的token id、新增的block id加入到CachedRequestState中。
+
+   对于更新input_batch来说，这里有两种情况，一种情况是该req上一次被调度过，这一次继续调度，那么此req已经存在于input_batch中，只需要对input_batch中的对应数据进行更新；一种情况是该req曾经被调度过，后来被抢占了，然后此次恢复调度，那么此req不存在于input_batch中，需要将它添加到input_batch中，这里依然也是没有立即添加到input_batch中，而是将req_id记录下来。
+
+然后开始处理上面记录下来的input_batch中新增的req对象，这里之所以要这么做是因为有一个小优化，input_batch中新增的req可以复用被remove的req的槽位，这样可以避免先将input_batch压缩再扩张
+
+![image-20250329134926169](llm serving.assets/image-20250329134926169.png)
+
+最后如果还有多余的被remove的req，再将它们在input_batch中的空间压缩
+
+![image-20250329135346879](llm serving.assets/image-20250329135346879.png)
+
+InputBatch的更新过程：
+
+- add_request的过程主要就是将该req的CachedRequestState对象中的信息添加到InputBatch的数组中，这里比较重要的是将每个req对应的block_ids保存在block_table中，
+
+  ![image-20250329150336813](llm serving.assets/image-20250329150336813.png)
+
+  根据req在batch中的index和该req的block数量定位到该req在block_table中的位置，然后将req的scheduler_outuput中的block_ids保存block_table的numpy数组中，也就是保存到了CPU的tensor上
+
+  ![image-20250318135949835](llm serving.assets/image-20250318135949835.png)
+
+- condense：将InputBatch中被remove的req的空间压缩。由于**InputBatch的buffer中所有使用的部分都要是从0开始并且连续的**，所以如果中间有req被remove了，那么需要从后面找一个req将它的数据复制到这个空槽位上。所以condense的开销较大，这也是为什么之前InputBatch新增req时尽量复用被remove的req的槽位
+
+`_update_states`函数结束后，execute_model再调用`_prepare_input`函数根据InputBatch中的数据计算出attention需要的metadata以及slot_mapping：
+
+首先将InputBatch中的BlockTable的CPU tensor复制到GPU tensor上，因为最终它要在kernel计算时使用，所以必须在GPU上。由于InputBatch是按照max_num_reqs和max_model_len分配的一个buffer，所以这里复制只需要复制BlockTable的CPU tensor中前面被使用的部分
+
+![image-20250329154011674](llm serving.assets/image-20250329154011674.png)
+
+![image-20250329154025297](llm serving.assets/image-20250329154025297.png)
+
+slot_mapping的计算过程：从InputBatch的block_table中读出每个token对应的block id，然后将block id乘以block_size（16）加上每个token在block内偏移量就能得到该token在一个layer的kv cache tensor中的偏移量
+
+假设有三个req，每个req被调度的token个数为 num_scheduled_tokens = [4, 17, 4]，总token数为25，block_size为16，一个seq最多的block个数128，一个seq最多的token个数为2048，一个batch最多的token个数为8192，那么得到的slot_mapping = [0, 1, 2, 3, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 176, 177, 178, 179, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...]，长度为8192
+
+
+
+
+
+
+
+
+
 在attention的计算过程中，用来定位kv cache的最主要的两个数据结构就是block_table和slot_mapping
 
 block_table在forward之前的`_update_states`函数中进行维护；BlockTable对象的内部实际上有三个数据结构，形状都是（max_num_reqs，max_num_blocks_per_req），也就是一个batch中最多的req个数乘一个req中最多的block个数，默认情况下是（1024，128）；它们三个存储的内容和形状都是相同的，只不过一个是GPU上的torch tensor，一个是CPU上的torch tensor，一个是CPU上的numpy数组
@@ -704,45 +1319,47 @@ Scheduler在调度req的时候会将每个req所映射的KVCacheBlock的id打包
 
 ![image-20250318141155732](llm serving.assets/image-20250318141155732.png)
 
-slot_mapping的计算过程：
+slot_mapping的计算过程：从InputBatch的block_table中读出每个token对应的block id，然后将block id乘以block_size（16）加上每个token在block内偏移量就能得到该token在一个layer的kv cache tensor中的偏移量
 
-假设有六个req，每个req被调度的token个数为 num_scheduled_tokens = [9, 41, 43, 40, 32, 16]，总token数为181，block_size为16，一个seq最多的block个数128，一个seq最多的token个数为2048，一个batch最多的token个数为8192，那么整个计算slot_mapping的过程为：
+具体来说：假设有三个req，每个req被调度的token个数为 num_scheduled_tokens = [4, 17, 4]，总token数为25，block_size为16，一个seq最多的block个数128，一个seq最多的token个数为2048，一个batch最多的token个数为8192，那么整个计算slot_mapping的过程为：
 
 每个token所在的req的index：
 
-req_indices = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, ...]
+req_indices = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]
 
 每个token在自己的req中的偏移量：
 
-position_np = [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 0, 1, 2, 3, 4, 5, 6, 7, 8, ...]
+position_np = [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 0, 1, 2, 3]
 
 每个token在token_ids_cpu_tensor中偏移量，使用req_indices * max_seq_len + position_np即可
 
-token_indices = [0, 1, 2, 3, 4, 5, 6, 7, 8, 2048, 2049, 2050, 2051, 2052, 2053, 2054, 2055, 2056, 2057, 2058, 2059, 2060, 2061, 2062, 2063, 2064, 2065, 2066, 2067, 2068, 2069, 2070, 2071, 2072, 2073, 2074, 2075, 2076, 2077, 2078, 2079, 2080, 2081, 2082, 2083, 2084, 2085, 2086, 2087, 2088, 4096, 4097, 4098, 4099, 4100, 4101, 4102, 4103, 4104, ...]
+token_indices = [0, 1, 2, 3, 2048, 2049, 2050, 2051, 2052, 2053, 2054, 2055, 2056, 2057, 2058, 2059, 2060, 2061, 2062, 2063, 2064, 4096, 4097, 4098, 4099]
 
-input_batch中有一个`token_ids_cpu_tensor`，形状为（1024，2048），代表1024个req的2048个token id。实际上这里只有六个req，所以除了前六行之外其他的都是0
+input_batch中有一个`token_ids_cpu_tensor`，形状为（1024，2048），代表1024个req的2048个token id。实际上这里只有三个req，所以除了前三行之外其他的都是0
 
 然后将token_ids_cpu_tensor展平，根据`token_indices`为索引，从中选出对应位置的数，保存到input_ids_cpu中；这里相当于是把input_batch中的token_ids_cpu_tensor中填充空余位置的0给去掉了，得到了形状为8192的一维的向量，每个req之间的token id是相邻的。
+
+input_ids_cpu = [    1,  1094,   263, 29871,     1,  1932, 11834,  5367,   596, 27593,29892, 15717,   526,  3734,   304,  9436,  1831,   278,  8210, 17026,29889,     1,  8527,   322, 23985, 0, 0 , 0 , 0 .....]
 
 ![image-20250318150022006](llm serving.assets/image-20250318150022006.png)
 
 然后将req_indices乘以每个req的最多的block数，用来在block_table中寻址（因为block_table的形状是（1024，128）），然后再将每个token在req中的偏移量除以block_size得到每个token在req中所在的block，二者相加得到每个token在block_table中的偏移量
 
-block_table_indices = [0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 129, 130, 130, 130, 130, 130, 130, 130, 130, 130, 256, 256, 256, 256, 256, 256, 256, 256, 256, ...]
+block_table_indices = [0, 0, 0, 0, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 129, 256, 256, 256, 256]
+
+![image-20250329174505071](llm serving.assets/image-20250329174505071.png)
 
 然后根据block_table_indices从block_table中选出每个token对应的block number
 
-block_numbers = [0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 12, 12, 12, 12, 12, 12, 12, 12, 12, ...]
+block_numbers = [0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 11, 11, 11, 11]
+
+![image-20250329174551437](llm serving.assets/image-20250329174551437.png)
 
 再计算出每个token在block内的偏移量，最后将block_number乘以block_size加上块内的偏移量就得到每个token在整个kv cache中的位置，存入slot_mapping中，形状是8196
 
 ![image-20250318151105699](llm serving.assets/image-20250318151105699.png)
 
-slot_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 192, 193, 194, 195, 196, 197, 198, 199, 200, ...]
-
-
-
-
+slot_mapping = [0, 1, 2, 3, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 176, 177, 178, 179, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ...]
 
 
 
@@ -770,22 +1387,6 @@ slot_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 80, 81, 82, 83, 84, 85, 86, 87, 88, 8
 
 ![image-20250317214425415](llm serving.assets/image-20250317214425415.png)
 
-![image-20250320111952873](llm serving.assets/image-20250320111952873.png)
-
-![image-20250320112023741](llm serving.assets/image-20250320112023741.png)
-
-![image-20250320142035747](llm serving.assets/image-20250320142035747.png)
-
-![image-20250321133702197](llm serving.assets/image-20250321133702197.png)
-
-![image-20250324185411733](llm serving.assets/image-20250324185411733.png)
-
-![image-20250324190001017](llm serving.assets/image-20250324190001017.png)
-
-![image-20250321133801240](llm serving.assets/image-20250321133801240.png)
-
-![image-20250321133628267](llm serving.assets/image-20250321133628267.png)
-
 然后进入page_attention_kernel中：grid_size是（num_heads，num_seqs），所以每个block负责query的一个头与kv的一个头的attention的计算
 
 ![image-20250317214549578](llm serving.assets/image-20250317214549578.png)
@@ -807,3 +1408,346 @@ slot_mapping = [0, 1, 2, 3, 4, 5, 6, 7, 8, 80, 81, 82, 83, 84, 85, 86, 87, 88, 8
 然后这里再遍历一个seq中每个block idx，从block_table中读取出对应的KVCacheBlock的块号，计算出key的块内偏移，最后和块号一起定位到key在key_cache中的位置
 
 ![image-20250318094838742](llm serving.assets/image-20250318094838742.png)
+
+### kernel hang
+
+#### vllm fa kernel调用路径
+
+![image-20250317214425415](llm serving.assets/image-20250317214425415.png)
+
+![image-20250320111952873](llm serving.assets/image-20250320111952873.png)
+
+然后进入到.deps目录下`vllm-flash-attn-src/csrc/flash_attn/flash_api.cpp`文件，
+
+![image-20250320112023741](llm serving.assets/image-20250320112023741.png)
+
+传入的参数为：q形状(25,32,128)，k和v形状(729,16,32,128)，out形状为(25,32,128)，cu_seqlens_q内容为(0,4,21,25)，cu_seqlens_k为空，seqused_k内容为(4,17,4)，blcok_table形状为(3,128),内容为![image-20250403105642375](llm serving.assets/image-20250403105642375.png)
+
+max_seqlen_q是17，max_seqlen_k是17，is_causal是true，window_size_left是-1，window_size_right是-1
+
+![image-20250320142035747](llm serving.assets/image-20250320142035747.png)
+
+![image-20250321133702197](llm serving.assets/image-20250321133702197.png)
+
+![image-20250324185411733](llm serving.assets/image-20250324185411733.png)
+
+在run_flash_splitkv_fwd函数中，首先调用`flash_fwd_splitkv_kernel`
+
+![image-20250324190001017](llm serving.assets/image-20250324190001017.png)
+
+然后调用`flash_fwd_splitkv_combine_kernel`
+
+![image-20250325162250751](llm serving.assets/image-20250325162250751.png)
+
+在`flash_fwd_splitkv_kernel`中：
+
+![image-20250325162138207](llm serving.assets/image-20250325162138207.png)
+
+![image-20250321133801240](llm serving.assets/image-20250321133801240.png)
+
+![image-20250321133628267](llm serving.assets/image-20250321133628267.png)
+
+在`flash_fwd_splitkv_combine_kernel`中
+
+![image-20250325162442161](llm serving.assets/image-20250325162442161.png)
+
+![image-20250325162512690](llm serving.assets/image-20250325162512690.png)
+
+#### 改动
+
+修改block大小：此处将block使用的warp大小从4改成1，也就是将block大小从128线程修改为32线程
+
+![image-20250325111858477](llm serving.assets/image-20250325111858477.png)
+
+并将这里注释，以避免编译时报错
+
+![image-20250325102652729](llm serving.assets/image-20250325102652729.png)
+
+修改后的benchmark结果：
+
+![image-20250325114127489](llm serving.assets/image-20250325114127489.png)
+
+原始baseline的benchmark结果：
+
+![image-20250325124138008](llm serving.assets/image-20250325124138008.png)
+
+可以看到修改后TTFT和TPOT明显增加
+
+使用nsys对服务进行profile：
+
+```bash
+# server
+nsys profile -t cuda,osrt,nvtx,cudnn,cublas -y 60 -d 5 -o baseline -f true -w true vllm serve meta-llama--Llama-2-7b-chat-hf/ --disable-log-requests --trust-remote-code --enforce-eager --dtype=half --tensor_parallel_size 2 --port=8000
+# client
+python3 benchmarks/benchmark_serving.py     --dataset-name random     --num-prompts 1000     --random-input 1000     --random-output 100     --random-range-ratio 0.1     --request-rate 4     --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json     --model meta-llama--Llama-2-7b-chat-hf/     --port 8000
+```
+
+- profile时有可能出现导出的nsys文件没有cuda，那就说明-y太短了，在client请求之前nsys profile就结束了
+- 为了确保两个profile结果有可比性，二者的CUDA HW使用最好都要是饱满的，也就是说nsys profile的5秒必须要是在vllm启动服务并且开始推理之后，CUDA HW栏不要出现空白，那样就说明在推理开始之前profile就开始了
+
+baseline的结果是`flash_fwd_splitkv_kernel`的平均耗时为36us，在所有kernel中的耗时占比为5.6%
+
+![image-20250325211948089](llm serving.assets/image-20250325211948089.png)
+
+而将block_size减小为32之后，flash_fwd_splitkv_kernel的平均耗时变为288us，在所有kernel中的耗时占比为32.9%
+
+![image-20250325212244766](llm serving.assets/image-20250325212244766.png)
+
+#### 同步拷贝
+
+将fa kernel中的k和v从全局内存的异步拷贝（计算与拷贝重叠）修改为同步拷贝，修改后的benchmark结果：
+
+![image-20250408155237509](llm serving.assets/image-20250408155237509.png)
+
+修改前的nsys结果
+
+![image-20250408161928578](llm serving.assets/image-20250408161928578.png)
+
+修改后的nsys结果：
+
+![image-20250408161957495](llm serving.assets/image-20250408161957495.png)
+
+kernel的执行时间基本没有变化，原因可能是原本的kernel中内存操作占用的时间就很少，即使让内存拷贝和计算完全同步，也难以增加多少时间
+
+![image-20250408162108078](llm serving.assets/image-20250408162108078.png)
+
+### compute_attn_splitkv
+
+假设有三个req，每个req被调度的token个数为 num_scheduled_tokens = [4, 17, 4]，总token数为25
+
+那么在`mha_varlen_fwd`中传入的参数为：q形状(25,32,128)，k和v形状(729,16,32,128)，out形状为(25,32,128)，cu_seqlens_q内容为(0,4,21,25)，cu_seqlens_k与cu_seqlens_q形状相同，内容为随机，seqused_k内容为(4,17,4)，blcok_table形状为(3,128),内容为![image-20250403105642375](llm serving.assets/image-20250403105642375.png)
+
+max_seqlen_q是17，max_seqlen_k是17，is_causal是true，window_size_left是-1，window_size_right是-1
+
+![image-20250418201530574](llm serving.assets/image-20250418201530574.png)
+
+在`mha_varlen_fwd`中，将一些参数保存在params结构体中，所以params中：
+
+- params.b = 3，表示batch_size
+- params.seqlen_q = 17，表示max_seqlen_q；params.seqlen_k = 17，表示max_seqlen_k
+- params.seqlen_q_rounded = 128，params.seqlen_k_rounded = 128
+- params.h = 32，表示num_heads；params.h_k = 32，表示key的num_heads
+- params.d = 128，表示head_size；params.d_rounded = 128
+- params中的qkv和out分别对应mha_varlen_fwd中传入的qkv和out
+- params.cu_seqlens_q_d = (0,4,21,25)，params.cu_seqlens_k_d的shape为4，内容为随机，params.seqused_k = (4,17,4)
+- params.total_q = 25，表示q的token数量
+- params中的block_table对应mha_varlen_fwd中传入的block_table，page_block_size=16；block_table_batch_stride=128，k_batch_stride=16 * 32 * 128
+- softmax_lse的形状为(num_heads, total_q)，也就是（32,25），内容为随机初始化；unpadded_lse为true
+
+![image-20250401141058744](llm serving.assets/image-20250401141058744.png)
+
+![image-20250401141040331](llm serving.assets/image-20250401141040331.png)
+
+注意，在vLLM层面上，对flash_attn kernel所有的调用传入的causal都是True，不管实际batch中的seq是不是处于prefill阶段
+
+<img src="llm serving.assets/image-20250418202125157.png" alt="image-20250418202125157" style="zoom:67%;" />
+
+而实际的计算过程中是否需要causal由mha_varlen_fwd函数计算，当一个batch中最长的query的seqlen等于1时，并且alibi为none时（默认情况），说明这个batch中没有perfill的seq，那么就将is_causal设为false
+
+```c++
+if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  
+if (is_causal) { window_size_right = 0; }
+```
+
+然后在`set_params_fprop`函数中再设置params的causal成员，正常情况下window_size_left和window_size_right都是-1，只有当is_causal等于false时mha_varlen_fwd中的window_size_right才会被设为0。所以在vllm的flash_attn的kernel中，**只有当一个batch中最长的query的seqlen的长度等于1时causal才是false，batch中但凡有一个长于1的query，causal都是True**
+
+```C++
+params.is_causal = window_size_left < 0 && window_size_right == 0;
+```
+
+然后调用run_mha_fwd，传入的参数为paged_KV = true，因为检测到block_table不为空；params中的num_splits参数为0，因为没有使用flash-decoding，只有调用了set_params_splitkv函数才会将num_splits设置为大于等于1的值。
+
+![image-20250401135911990](llm serving.assets/image-20250401135911990.png)
+
+在`run_mha_fwd`函数中，如果params中的num_splits大于1，或者调用者要求强制进行split（也就是当使用了PageAttention时）那么就会调用`run_mha_fwd_splitkv_dispatch`函数；否则就不会进行split，调用run_mha_fwd_函数
+
+![image-20250401140237937](llm serving.assets/image-20250401140237937.png)
+
+然后在此处计算出来BlockM等于64，表示在seq_len_q维度上切块大小为64；BlockN等于128，表示在seq_len_k维度上切块大小为128；Headdim是128，表示一个head的维度是128；一个block中的warps数量默认为4，也就是说一个block的大小为128，将这些数据保存在Kernel_traits中
+
+![image-20250401141301844](llm serving.assets/image-20250401141301844.png)
+
+然后在run_flash_splitkv_fwd中使用参数中qkv的形状和Kernel_traits中分块的大小计算grid_size，其中params.b表示batch_size，params.h表示num_heads，最后得到的grid_size为（seqlen_q / BlockM, batch_size, num_heads)
+
+![image-20250401142119367](llm serving.assets/image-20250401142119367.png)
+
+也就是说在batch_size、num_heads和seqlen_q三个维度上并行，每个block要处理计算的部分如下图所示：
+
+![img](llm serving.assets/v2-b5add2d3319cb41c9bb9c7f36ebbcdc3_r.jpg)
+
+然后使用计算出来的grid_size和block_size启动`flash_fwd_splitkv_kernel`：
+
+![image-20250401143416982](llm serving.assets/image-20250401143416982.png)
+
+先找到当前block在grid中的位置，m_block表示在seq_len_q维度上的分块的idx；bidb表示blockIdxBatch，是当前block所处理的batch的idx；bidh表示blockIdxHead，是当前block所在的head的idx；然后将这些block的位置信息传入`compute_attn_1rowblock_splitkv`函数中
+
+![image-20250401145031928](llm serving.assets/image-20250401145031928.png)
+
+在`compute_attn_1rowblock_splitkv`的kernel中先对seq_q分块，根据当前block在seq_q上的分块idx m_block定位到对应的（blockM，headDim）形状的分块
+
+![image-20250407143428607](llm serving.assets/image-20250407143428607.png)
+
+再对seq_k和seq_v分块，分块的大小为（blockN，headDim），使用步长为（k_row_stride，1）跳过num_heads维度
+
+![image-20250407143536177](llm serving.assets/image-20250407143536177.png)
+
+再创建TiledCopy，Q的TIledCopy的threadBlock布局为16 * 8，每个线程一次负责拷贝8个元素；KV的TiledCopy的threadBlock布局也是16 * 8，每个线程一次负责拷贝（8,8）的元素
+
+![image-20250407144445068](llm serving.assets/image-20250407144445068.png)
+
+然后使用ThrCopy对全局内存中的qkv tensor gQ gK gV进行分割，得到在全局内存中每个线程负责搬运的Q K V的Tensor
+
+![image-20250407145057380](llm serving.assets/image-20250407145057380.png)
+
+但是由于gK和gV Tensor中的k_ptr和v_ptr实际上是kv cache的ptr，而不是seq_k和seq_v实际的物理块的ptr，所以还要对每个线程的tKgK和tVgV的指针移动到它的数据在kv cache中实际的位置
+
+![image-20250407145644409](llm serving.assets/image-20250407145644409.png)
+
+这里的`resolve_thread_kv_page_slice_offset`函数就负责在给定线程tidx和给定blockN的情况下，计算出该线程在blockN中负责搬运的数据在kv cache中的偏移量，具体来说是：先根据所在的blockN和线程tid定位到该线程负责搬运的元素在整条seq_kv上的位置，再计算出该位置的KVCacheBlock在该seq的block_table中的位置，从而获取到该元素实际的物理块的idx，然后计算得到该线程负责搬运的元素在kv cache中的偏移量。然后由于gK和gV是kv cache，所以加上该函数计算得到的结果，就能在kv cache中定位到每个线程负责搬运的元素
+
+![image-20250407145738626](llm serving.assets/image-20250407145738626.png)
+
+然后再把tQgQ和tKgK拷贝到共享内存里的tQsQ和tKsK中
+
+![image-20250407150214163](llm serving.assets/image-20250407150214163.png)
+
+copy负责遍历tile后的每一行和每一列，将每个tile从gmem拷贝到smem
+
+![image-20250407151110187](llm serving.assets/image-20250407151110187.png)
+
+## sglang
+
+ModelRunner构造时，如果提供的server_args中的attention_backend为none，那么就会默认使用flashinfer作为attention_backend
+
+![image-20250423153854636](llm serving.assets/image-20250423153854636.png)
+
+## LMCache
+
+vLLM 生产堆栈（vLLM Production Stack），是一个开源的集群级全栈 vLLM 服务系统参考实现
+
+无论 LLM 变得多么智能，读取外部文本、视频等数据总是非常耗时。但是由于大多数数据都是重复读取的 ，例如热门书籍、聊天记录和新闻文档，LMCache通过存储所有可重用文本的kv cache，让 LLM 只读取一次文本来降低这种成本。通过将LMCache与vLLM结合，LMCache将TTFT的时间减少了三到十倍
+
+![Icon](llm serving.assets/lmcache-diagram.png)
+
+如上图所示，LMCache的核心是芝加哥大学最近的两个研究项目：
+
+1. CacheBlend [EuroSys'25] 以最小的计算量将多个kv cache混合，以保留交叉注意力机制。这样可以动态地形成一个新的kv cache。相比之下，vLLM 仅重用输入前缀的kv  cache。这对于 RAG 应用尤其有用，因为 多个重复使用的文本构成了LLM的输入
+2. CacheGen [SIGCOMM'24] 能有效地将 KV 缓存编码为比特流并存储在磁盘上。这样就可以在廉价磁盘上存储无限量的 KV 缓存，并在多个 vLLM 实例之间共享。而 vLLM 只能将 KV 缓存存储在一个 LLM 实例的内部 GPU 和 CPU 内存中。使用多个 vLLM 实例为众多用户提供服务的多轮聊天应用程序迫切需要这种功能。
+
+CacheBlend：
+
+检索增强生成（RAG）通过从外部数据库中检索相关文本块来补充用户查询，使模型能够生成高度准确和上下文感知的响应。通常情况下，添加更多文本作为输入的上下文可以提高 LLM 生成的质量，但是这样RAG的TTFT就会很慢。并且传统的基于前缀的kv cache（如vLLM的prefix caching）对RAG来说几乎和没有缓存一样慢。这是因为多个输入文本块是动态选择的，所以当它们在输入中concat时，所有文本块（除了第一个）都不会命中prefix cache。
+
+RAG 数据库中每个文本块的 KV 缓存都是单独预计算并存储的。当查询到来时，RAG 搜索引擎首先识别出 N 个相关的文本块。CacheBlend 不是将文本作为 LLM 输入，而是将它们的 N 个 KV 缓存直接输入给 LLM。
+
+这种想法的简单实现会破坏语义，因为这些文本块之间的交叉注意力在单独计算的 KV 缓存中未被保留。CacheBlend 通过选择性地重新计算一小部分关键 token 的 KV 缓存，避免了质量下降。与此同时，重新计算部分 token 所带来的小额额外延迟可以与 KV 缓存的检索并行处理。
+
+LMCache功能：
+
+1. **KV cache sharing & storage**：（分布式）KV 缓存共享与存储，加速上下文重用时的推理。**KV 缓存组件由 LMCache 提供支持，配备高效的 KV 传输 CUDA 内核和专用的零拷贝设计。**
+2. **Prefix-aware routing**：前缀感知路由检查请求的上下文是否已缓存于某个vLLM实例的内存池中，然后将请求转发到具有预计算缓存的vLLM实例
+3. **Observability** ：可观测性模块（如Prometheus）观察单个引擎状态和查询级别指标（TTFT、TBT、吞吐量），可以使用监控Web UI将指标可视化（如Grafana）
+4. **Autoscaling** ：自动扩缩和集群管理器监控整体负载，必要时启动新的 vLLM 节点。
+
+![Icon](llm serving.assets/stack-overview-2.png)
+
+![image](llm serving.assets/6fcc5955-aff8-4de4-93bb-b844124815b3.png)
+
+### vLLM V1 + LMCache
+
+![image-20250501183004452](llm serving.assets/image-20250501183004452.png)
+
+LMCache管理kv cache的两个核心功能：存储和传输
+
+![image](llm serving.assets/5c8d1086-b4c7-44b9-bab7-bcd4c5776b69.png)
+
+1. 存储：数据库风格的加载和卸载，该模式专注于持久化 KV 缓存存储，LMCache 维护一个数据库风格的抽象，可以将热点 KV 条目从 GPU 内存卸载到 CPU 内存，甚至磁盘，使用自定义的驱逐和预取策略。这实现了长期缓存的持久化和检索
+2. 传输：点对点直连传输，针对分布式预填充场景，在这些场景中需要实时从远程节点获取 KV 缓存。LMCache 通过点对点 KV 传输，减少了冗余计算并实现了跨节点缓存复用。为了进一步推动 KV 缓存传输，LMCache 现已原生支持来自 NVIDIA Dynamo 的 NIXL，这是一种为异构硬件设计的新型通信抽象。NIXL 支持 NVLink、具备 RDMA 功能的网卡以及 GPU 直连存储。LMCache 的模块化传输层直接接入 NIXL 的通信栈，使其能够动态选择 GPU、CPU 和存储之间最快的数据路径。无论是本地多 GPU 系统还是数据中心级集群，搭载 NIXL 的 LMCache 都能实现极高速的 KV 缓存传输，通常比重新计算单个 token 的注意力还要快。
+
+LMCache kvconnector支持本地的后端和远程的后端，本地后端即将kv cache保存在本地的cpu或者disk上；远程的后端即将kv cache保存在远程的存储系统上，如redis或者server；最近支持了在远程后端上接入Mooncake store（目前只有V0支持？）
+
+![Icon](llm serving.assets/lmcache-tencent.jpg)
+
+LMCache 采用分层存储架构，其中 `StorageManager` 作为核心管理层，协调本地磁盘存储（ `LocalDiskBackend` ）和远程存储（ `RemoteBackend` ）。 `RemoteBackend` 使用不同的 `RemoteConnector` 实现连接各种存储后端。例如， `MooncakeStoreConnector` 专门为 Mooncake 分布式存储系统设计。
+
+![Icon](llm serving.assets/lmcache_arch.png)
+
+初始化流程：
+
+1. 当 LMCache 的 `LMCacheConnector` 被初始化时，它会调用 `init_lmcache_engine` 方法，构造了一个 `LMCacheEngine` 。
+
+2. 在构造 `LMCacheEngine` 期间，会为其创建一个 `StorageManager` 。
+
+3. 在构造 `StorageManager` 时，根据配置会创建不同的 `StorageBackend` 实例：
+
+   - 如果 `local_disk` 设置为 `True` 且 `max_local_disk_size` （以 GiB 为单位）具有有效值，则会构造一个 `LocalDiskBackend` 。
+   - 如果 `remote_url` 不为空，则构造一个 `RemoteBackend` 。如果同时配置了 `local_disk` 和 `remote_url` ，则构造两个后端。如果两者都未配置，则不构造任何后端。
+
+   在 `StorageManager` 构建期间，它还会检查 `local_cpu` 是否为 `True` 。如果是，则将 `use_hot` 设置为 true。当启用 `use_hot` 时，被 `put` 的 KV 缓存条目会存储在 `hot_cache` 中，且 `get` 操作将优先从 `hot_cache` 中检索。
+
+构建 `RemoteBackend` 时，会解析配置的 `remote_url` 。从 URL 中提取的方案决定构建哪种具体的连接器实现。`RemoteConnector` 作为 LMCache 与远程存储系统交互的抽象接口。其主要职责包括：连接管理，数据存储与检索，资源管理
+
+![Icon](llm serving.assets/connector.png)
+
+未完，可以参考https://blog.lmcache.ai/2025-04-22-tencent/
+
+### PD分离
+
+vLLM官方没有实现PD分离，尤其是 XpYd 配置（X 个预填充器，Y 个解码器），该配置在生产中被广泛使用以最大化多节点吞吐量。
+
+实现方式：任何 PD 系统的核心挑战在于高效地在预填充器和解码器之间传输 KV 缓存。
+
+LMCache的做法：
+
+1. 从vLLM的kv cache tensor中提取指定的部分kv cache
+2. LMCache将这些kv cache组装到GPU常驻的连续缓冲区中
+3. 该缓冲区通过NIXL通过网络发送给解码器
+
+![image](llm serving.assets/9faaf36c-2a01-4963-8325-15cff4e3e660.png)
+
+使用缓冲区的原因是：如果直接从 vLLM 的分页内存逐块发送 KV 缓存。默认块大小为 16 个token，这会导致许多小传输，每次都未能充分利用带宽。而LMCache 将 KV 块批量合并到一个大型缓冲区，实现了高GPU到NIC的吞吐量，近乎零的内存拷贝开销。这**类似OS如何使用IO缓冲区来减少系统调用开销**
+
+- 如果直接增加vLLM的kv cache tensor的page size，然后直接从vLLM的kv cache中传输，这样虽然会减少拷贝的开销，但是page size变大会导致降低vLLM的prefix cache的命中率
+
+
+
+### example
+
+跨多个 vLLM 实例共享 KV 缓存：
+
+- LMCache 通过 `lmcache.server` 模块支持在不同 vLLM 实例之间共享 KV。
+
+  ```
+  # Start lmcache server
+  lmcache_server localhost 65432
+  ```
+
+  然后，使用 LMCache 配置文件启动两个 vLLM 实例
+
+  ```sh
+  wget https://raw.githubusercontent.com/LMCache/LMCache/refs/heads/dev/examples/example.yaml
+  
+  # start the first vLLM instance
+  LMCACHE_CONFIG_FILE=example.yaml CUDA_VISIBLE_DEVICES=0 lmcache_vllm serve lmsys/longchat-7b-16k --gpu-memory-utilization 0.8 --port 8000
+  
+  # start the second vLLM instance
+  LMCACHE_CONFIG_FILE=example.yaml CUDA_VISIBLE_DEVICES=1 lmcache_vllm serve lmsys/longchat-7b-16k --gpu-memory-utilization 0.8 --port 8001
+  ```
+  
+  
+
+## CachedAttention
+
+由于在多轮对话场景中需要重复使用之前对话的kv cache，如果每一轮对话结束之后就将该轮对话的kv cache删除，那么下一轮对话时就需要重复对之前对话所有的上下文重新prefill。所以这里通常会采用多级缓存系统（即HBM、CPU、Disk），一轮对话结束后可以将kv cache卸载到CPU或者disk上，下一轮对话开始时再从CPU或者disk上将kv cache重新加载到HBM上。但是问题在于：
+
+1. kv cache的加载和保存花费的时间很长，如何减少或隐藏这个时间？
+2. 将kv cache存放在磁盘上虽然可以扩展存储空间，但是访问速度太慢，如何保证要访问的kv cache尽量放在CPU上？
+3. 对于使用滑动窗口的模型，超过了上下文的窗口的历史prompt会被截断；这样会导致无法使用历史对话的kv cache，因为kv cache保存的是经过位置编码后的key和value，所以如果前缀被截断了，那么后续的token在seq中的位置就改变了，那么计算出来的位置编码会改变，那么kv cache也会改变，所以需要对截断后的历史对话重新计算kv cache。如何能够让截断后的prompt也能复用历史kv cache？
+   - 这一点在vLLM和sglang等框架中也有体现，它们使用的prefix caching，也就是前缀匹配，被截断后的prompt由于前缀没有了，所以计算出来的hash值也改变了，无法与缓存系统中保存的历史对话的kv cache匹配上。
+
+解决方法：
+
+1. 为了减少从KV缓存系统加载到HBM的开销，AttentionStore利用分层预加载方案来重叠KV缓存加载和推理计算。为了减少从HBMs保存KV缓存到主机内存的开销，AttentionStore利用异步保存方案来重叠保存和推断计算
+2. 为了减少访问慢磁盘对推理性能的影响，提出了一种调度器感知的预取方案，利用调度器来从磁盘预取kv cache到CPU。同时，为了有效利用有限的主机内存空间，提出了一种调度器感知的kv cache淘汰方案，识别最不有价值的KV缓存并将其驱逐到磁盘或缓存系统之外（类似vLLM的swap LRU的req？）
+3. 为了处理由于上下文窗口截断导致的历史对话kv cache失效的情况，使用一种位置编码解耦截断方案，在不嵌入位置编码的情况下保存KV缓存，从而直接支持KV缓存的截断。在加载KV缓存时，AttentionStore重新嵌入新的位置编码到KV缓存中
+
